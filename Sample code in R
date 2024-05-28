@@ -1,0 +1,248 @@
+#Getting working correlation matrix using JGEE from frequentist model with just one covariate
+library(JGEE)
+library(haven)
+library(haven)
+
+#you will have to run the %partitionedDataMatrix macro in SAS to obtain the valid modement conditions for each outcome 
+#then import the partitioned data matrix with the code below
+
+add_health_joint_gee <- read_sas("C:/your folder/joint Bayesian GEE/add_health_joint_gee.sas7bdat", 
+                                 NULL)
+View(add_health_joint_gee)
+#transforming dataframe from sas into dataset in R
+add_health=as.data.frame(add_health_joint_gee)
+
+#fitting Joint GEE frequentist model with no covariates just to get working correlation matrix between longitudinal outcomes
+
+formulaj2=cbind(SMOKING, ALCOHOL)~1
+familyj2=list(binomial(link="logit"),binomial(link="logit"))
+
+fitjgee2=JGee2(formula=formulaj2,id=add_health[,1],data=add_health,nr=2,na.action=NULL,
+               family=familyj2, corstr1="unstructured", Mv=NULL, corstr2="unstructured",
+               beta_int=rep(0,2), R1=NULL, R2=NULL, scale.fix=FALSE, scale.value=1, maxiter=30,
+               tol=10^-3, silent=FALSE)
+summary(fitjgee2)
+#getting working correlation matrix
+Rmat=summary(fitjgee2)$working.correlation
+#preparing list of objects for the stan function
+Nobs=nrow(add_health)
+#give us number of time points
+Tp=4
+#getting number of subjects
+N=Nobs/Tp
+
+#getting outcome 1
+Y1=add_health$SMOKING
+Y2=add_health$ALCOHOL
+
+#getting design matrix for outcome 1
+#moment conditions were valid for all lag of the two time dependent covariates
+X1=matrix(nrow=Nobs, ncol=10, NA)
+X1[,1]=rep(1, Nobs)
+X1[,2]=add_health$RACE_
+X1[,3]=add_health$GENDER
+X1[,4]=add_health$ACTIVITYSCALE_0
+X1[,5]=add_health$FEELINGSCALE_0
+
+X1[,6]=add_health$ACTIVITYSCALE_1
+X1[,7]=add_health$FEELINGSCALE_1
+
+X1[,8]=add_health$ACTIVITYSCALE_2
+
+X1[,9]=add_health$ACTIVITYSCALE_3
+X1[,10]=add_health$FEELINGSCALE_3
+
+#getting desing matrix for outcome 2
+#moment conditions were also valid for all lag of the two time-dependent covariates thus the design matrix is the same as that of outcome 1
+X2=matrix(nrow=Nobs, ncol=10, NA)
+X2[,1]=rep(1, Nobs)
+X2[,2]=add_health$RACE_
+X2[,3]=add_health$GENDER
+X2[,4]=add_health$ACTIVITYSCALE_0
+X2[,5]=add_health$FEELINGSCALE_0
+
+X2[,6]=add_health$ACTIVITYSCALE_1
+X2[,7]=add_health$FEELINGSCALE_1
+
+X2[,8]=add_health$ACTIVITYSCALE_2
+X2[,9]=add_health$FEELINGSCALE_2
+
+X2[,10]=add_health$FEELINGSCALE_3
+
+#number of parameters to estimate for outcome 1
+P1=ncol(X1)
+#number of parameters to estimate for outcome 2
+P2=ncol(X2)
+
+library(rstan)
+library(ggplot2)
+library(devtools)
+library(dplyr)
+
+rstan_options(auto_write=TRUE)
+options(mc.cores=parallel::detectCores())
+
+
+Bayes_JGEE<-"
+data{
+//in this section we define data that must be passed to Stan
+
+int N; //number of subjects
+int T; //number of time points
+int R; //number of outcomes/responses
+int P1; //number of regression coefficients to be estimated for outcome 1
+int P2; //number of regression coefficients to be estimated for outcome 2
+
+//suppose we have 2 outcomes, then we have to pass two design matrices X1 and X2
+//because even we have the same covariates, the valid moment conditions may not be the same
+
+matrix [N*T, P1] X1; //design matrix for outcome Y1
+matrix [N*T, P2] X2; //design matrix for outcome Y2
+
+//since we have two outcome we also have to pass to outcome vectors Y1 and Y2
+vector [N*T] Y1; //outcome vector Y1
+vector [N*T] Y2; //outcome vector Y2
+
+//since we are using working correlation matrix estimated using other packages perhaps r-package JGEE 
+//we must also pass such matrix to R stan, this assuming we are treating correlation as nuisance
+matrix [R*T, R*T] Rmat; //working correlation matrix estimated in step before Bayesian model
+}
+
+parameters {
+//Define parameters we will estimate, since we have two outcomes we have beta1 and beta2
+vector [P1] beta1; //regression coefficients for outcome Y1
+vector [P2] beta2; //regression coefficients for outcome Y2
+}
+
+model{
+//This is where we right the model, calculate residuals, variances, normalized log-likelihood, etc
+//first declare matrices, vectors, etc that will help us get the normalized log=likelihood for GEE model
+
+//logits for each outcome
+vector [N*T] logit1; //logits for outcome Y1
+vector [N*T] logit2; //logits for outcome Y2
+
+//predicted probabilities for each outcome
+vector [N*T] yhat1; //pred probs for outcome Y1
+vector [N*T] yhat2; //pred probs for outcome Y2
+
+//residuals for each outcome
+vector [N*T] residual1; //residuals for outcome Y1
+vector [N*T] residual2; //residuals for outcome Y2
+
+//squared variances for each outcome
+vector [N*T] variance1; //variances for outcome Y1
+vector [N*T] variance2; //variances for outcome Y2
+
+//vector that will store residulas for each of the subjects when calculating quadratic form for log-likelihood
+vector [T] Ri1; //vector for residuals for outcome 1, subject i
+vector [T] Ri2; //vector for residuals for outcome 2, subject i
+vector [T*R] Residi; //vector for residuals for subject i
+
+//vector that will keep variance for subject i when calculating quadratic form for log-likelihood
+vector [T] vari1; //variances for subject i outcome Y1
+vector [T] vari2; // variances for subject i outcome Y2
+vector [T*R] vari; //vector of squared variances for subject i
+
+//Calculating variance covariance matrix for subject i
+matrix [T*R, T*R] Ai12; //This will keep matrix Ai to the 1/2 for each subject
+matrix [T*R, T*R] Vi; // This will be the matrix Vi which is Ai to the 1/2 times R time Ai to the 1/2
+matrix [T*R, T*R] iVi; //Inverse of Vi matrix 
+// Saving determinat of vi, its log, the quadratic form Qi, their sum for subject i and the total sum for normalized quasi-likelihood
+real detVi;
+real absdetVi;
+real logdetvi;
+real Qi;
+real sumi;
+real totalsum=0;
+
+//Define the priors 
+beta1 ~ normal(0,100); //assuming same prior for all coefficients for outcome Y1
+beta2 ~ normal(0,100); //assuming same prior for all coefficients for outcome Y2
+
+//calculate logits for both models
+logit1=X1*beta1;
+logit2=X2*beta2;
+
+//calculate Yhats for both models
+for (i in 1:(N*T)){
+yhat1[i]=exp(logit1[i])/(1+exp(logit1[i]));
+yhat2[i]=exp(logit2[i])/(1+exp(logit2[i]));
+//calculate variances for both models;
+variance1[i]=sqrt(yhat1[i]*(1-yhat1[i]));
+variance2[i]=sqrt(yhat2[i]*(1-yhat2[i]));
+
+}
+//calculate residuals for both models;
+residual1=Y1-yhat1;
+residual2=Y2-yhat2;
+
+
+//get contribution of each subject to the normalized log-likelihood using GEE approach
+for (i in 1:N){
+//getting elements for outcome vector Y1
+for (j in 1:T){
+Ri1[j]=residual1[((i-1)*T)+j];
+vari1[j]=variance1[((i-1)*T)+j];
+}
+//getting elements for outcome vector Y2
+for (j in 1:T){
+Ri2[j]=residual2[((i-1)*T)+j];
+vari2[j]=variance2[((i-1)*T)+j];
+}
+
+Residi=append_row(Ri1, Ri2);//appending vector of residuals into a single vector of residuals
+vari=append_row(vari1, vari2); //appending vector of squared variances into a single vector
+Ai12=diag_matrix(vari); //creating diagnonal matrix of squared variances
+Vi=Ai12*Rmat*Ai12; //calculating Variance covariance matrix for subject i
+iVi=inverse(Vi); //calculating inverse of variance covariance matrix for subject i
+detVi=determinant(Vi); //calculating determinant of variance covariance matrix for subject i
+absdetVi=abs(detVi);
+logdetvi=log(detVi); //calculating log of determinant of variance covariance matrix for subject i
+Qi=(Residi')*iVi*Residi; //calculating quadratic form for normalized log-likelihood
+sumi=Qi+logdetvi;//calculating contribution to normalized log-likelihood of subject i
+totalsum=totalsum+sumi; //adding contribution of subject i to total sum for normalized likelihood
+}
+
+//Getting quasi-likelihood function for quasi-posterior distribution
+target += -0.5*totalsum;
+}
+"
+
+compiled_function=stan_model(model_code =Bayes_JGEE) # you could use file = "path/to/yourfile.stan" if you have saved it as so
+# And make the function available to the user in R
+expose_stan_functions(compiled_function)
+data_list_2 <- list(X1 = X1, X2=X2,  N = N,T=Tp, Rmat=Rmat, R=2, Y1=Y1, Y2=Y2, P1=P1, P2=P2)
+correct_fit <- stan(model_code = Bayes_JGEE, data = data_list_2, cores = 7, chains = 3, iter = 4000)
+
+library(shinystan)
+library(devtools)
+
+print(correct_fit)
+
+library(reshape2)
+
+# Extract params as a (draws * number of chains * number of params) array
+extract(correct_fit, permuted = F, pars = c("beta1", "beta2")) %>% 
+  # Stack the chains on top of one another and drop the chains label
+  plyr::adply(2) %>% 
+  dplyr::select(-chains) %>% 
+  # Convert from wide form to long form (stack the columns on one another)
+  melt() %>% 
+  # Perform a left join with the known parameters
+  # Generate the plot
+  ggplot(aes(x = value)) + 
+  geom_density(fill = "orange", alpha = 0.5) + # Make it pretty
+  facet_wrap(~ variable, scales = "free") +
+  ggtitle("Actual parameters and estimates\ncorrectly specified model\n")
+
+
+
+library(bayesplot)
+
+traceplot(correct_fit, pars = c("beta1", "beta2")) +
+  ggtitle("Traceplot of regression coefficients") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+
+
+
