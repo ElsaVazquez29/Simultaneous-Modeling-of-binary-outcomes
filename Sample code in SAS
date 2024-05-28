@@ -1,0 +1,302 @@
+data chinese;
+set chin.chinese_longevity_data;
+run;
+
+proc print data=chinese (obs=10);
+run;
+
+
+
+/*finding valid moments of interviewer rated health*/
+%partitionedGMM2(file=chinese, timeVar=wave, outVar=inter_healthg,
+ predVarTD=  dressingb , 
+ idVar=id, alpha=0.05, predVarTI=, distr=bin,
+ optim=NLPnms MC=LWY);
+
+proc print data=mydata3 (obs=3);
+run;
+
+data interviewer_health;
+set mydata3;
+run;
+
+/*creating design matrix*/
+proc transreg data=interviewer_health design;
+model class(wave/zero=last);
+id id INTER_HEALTHG DRESSINGB_0 DRESSINGB_1 DRESSINGB_2 DRESSINGB_3;
+output out=design1 (drop=_TYPE_ _NAME_ wave1 wave2 wave3 wave4);
+run;
+
+proc print data=design1;
+run;
+
+/*creating dataset with just the covariates in the model*/
+data covariates1 (keep=Intercept DRESSINGB_0 DRESSINGB_1 DRESSINGB_2 DRESSINGB_3);
+set design1;
+run;
+
+proc print data=covariates1;
+run;
+
+/*creating dataset with variables first and last to keep track of when subjects start and end*/
+data recodedsplit1(drop=counter intercept &_trgind);
+ set design1 nobs=_n;
+ call symputx('nrec', _n);
+ by id;
+ if first.id then counter=0;
+ counter+1;
+ first = first.id;
+ last = last.id;
+ if _n_ = _n then
+ do;
+ call symputx('nrep',counter);
+ end;
+run;
+
+
+
+/*finding valid moments for ability to attend physical check*/
+%partitionedGMM2(file=chinese, timeVar=wave, outVar=physical_checkb,
+ predVarTD= own_decisionb , 
+ idVar=id, alpha=0.05, predVarTI=, distr=bin,
+ optim=NLPnms MC=LWY);
+
+
+proc print data=mydata3 (obs=9);
+run;
+
+data physical_check;
+set mydata3;
+run;
+
+/*creating design matrix*/
+proc transreg data=physical_check design;
+model class(wave/zero=last);
+id id PHYSICAL_CHECKB OWN_DECISIONB_0 OWN_DECISIONB_1 OWN_DECISIONB_2 OWN_DECISIONB_3;
+output out=design2 (drop=_TYPE_ _NAME_ wave1 wave2 wave3 wave4);
+run;
+
+proc print data=design2 (obs=10);
+run;
+
+/*creating dataset with just the covariates in the model*/
+data covariates2 (keep=Intercept OWN_DECISIONB_0 OWN_DECISIONB_1 OWN_DECISIONB_2 OWN_DECISIONB_3);
+set design2;
+run;
+
+proc print data=covariates2 (obs=10);
+run;
+
+
+
+/*getting Rmat matrix for GEE*/
+data chinese;
+set chin.chinese_joint_GEE;
+run;
+
+proc print data=chinese (obs=10);
+run;
+
+
+data chinese;
+set chinese;
+where wave ne 4;
+run;
+
+
+
+
+options set=R_HOME='C:\Program Files\R\R-3.6.1';
+
+proc options option=RLANG;
+run;
+
+proc iml;
+run ExportDataSetToR("work.chinese", "chinese" );
+
+submit/R;
+
+#Getting working correlation matrix using JGEE from frequentist model with just one covariate
+library(JGEE);
+View(chinese);
+#fitting Joint GEE frequentist model with no covariates just to get working correlation matrix between longitudinal outcomes
+
+formulaj2=cbind(INTER_HEALTHG, PHYSICAL_CHECKB)~1;
+familyj2=list(binomial(link="logit"),binomial(link="logit"));
+
+fitjgee2=JGee2(formula=formulaj2,id=chinese[,1],data=chinese,nr=2,na.action=NULL,
+               family=familyj2, corstr1="exchangeable", Mv=NULL, corstr2="exchangeable",
+               beta_int=rep(0,2), R1=NULL, R2=NULL, scale.fix=FALSE, scale.value=1, maxiter=30,
+               tol=10^-3, silent=FALSE);
+summary(fitjgee2);
+#getting working correlation matrix
+Rmat=as.matrix(summary(fitjgee2)$working.correlation);
+endsubmit;
+run ImportMatrixFromR( Rmat, "Rmat" );  
+print Rmat;
+create Rmat2 from Rmat;
+append from Rmat;
+close Rmat2;
+quit;
+
+proc print data=Rmat2;
+run;
+
+/*fitting model in proc mcmc*/
+proc mcmc nbi=2000 nmc=3000 statistics=all diagnostics=all;
+/*arrays for outcome 1*/
+array beta[5];
+array data1[1]/nosymbols;
+array y1[1]/nosymbols;
+array yhat1[&nrec];
+array logits1[&nrec];
+array residuals1[&nrec];
+array std1[&nrec];
+
+/*arrays for outcome 2*/
+array alpha[5];
+array data2[1]/nosymbols;
+array y2[1]/nosymbols;
+array yhat2[&nrec];
+array logits2[&nrec];
+array residuals2[&nrec];
+array std2[&nrec];
+
+/*arrays for joint likelihood*/
+array wc[1]/nosymbols;
+array residi[8,1];
+array residit[1,8];
+array Ai[8,8];
+array Vi[8,8];
+array Vim[8,8];
+array Viinv[8,8];
+array p1[1, 8];
+array detVi[1,1];
+array mult1[1,1];
+
+array sumi[1,1];
+array tsum[1,1];
+call fillmatrix(tsum, 0);
+
+begincnst;
+/*reading data for outcome 1*/
+rc=read_array("design1",y1, "INTER_HEALTHG");
+rc=read_array("covariates1", data1);
+rc=read_array("design2",y2, "PHYSICAL_CHECKB");
+rc=read_array("covariates2", data2);
+rc = read_array("Rmat2",wc);
+endcnst;
+parms (beta:) 0;
+prior beta: ~ normal(0, var=1e6);
+parms (alpha:) 0;
+prior alpha1 ~ normal (0, var=1e6);
+prior alpha2 ~ normal (0, var=1e6);
+prior alpha3 ~ normal (0, var=1e6);
+prior alpha4 ~ normal (0, var=1e6);
+prior alpha5 ~ normal (0, var=1e6);
+
+
+/*filling up of diagnoanls of Ai matrix*/ 
+beginnodata;
+Ai[1,2]=0;
+Ai[1,3]=0;
+Ai[1,4]=0;
+Ai[1,5]=0;
+Ai[1,6]=0;
+Ai[1,7]=0;
+Ai[1,8]=0;
+
+Ai[2,1]=0;
+Ai[2,3]=0;
+Ai[2,4]=0;
+Ai[2,5]=0;
+Ai[2,6]=0;
+Ai[2,7]=0;
+Ai[2,8]=0;
+
+Ai[3,1]=0;
+Ai[3,2]=0;
+Ai[3,4]=0;
+Ai[3,5]=0;
+Ai[3,6]=0;
+Ai[3,7]=0;
+Ai[3,8]=0;
+
+Ai[4,1]=0;
+Ai[4,2]=0;
+Ai[4,3]=0;
+Ai[4,5]=0;
+Ai[4,6]=0;
+Ai[4,7]=0;
+Ai[4,8]=0;
+
+Ai[5,1]=0;
+Ai[5,2]=0;
+Ai[5,3]=0;
+Ai[5,4]=0;
+Ai[5,6]=0;
+Ai[5,7]=0;
+Ai[5,8]=0;
+
+Ai[6,1]=0;
+Ai[6,2]=0;
+Ai[6,3]=0;
+Ai[6,4]=0;
+Ai[6,5]=0;
+Ai[6,7]=0;
+Ai[6,8]=0;
+
+Ai[7,1]=0;
+Ai[7,2]=0;
+Ai[7,3]=0;
+Ai[7,4]=0;
+Ai[7,5]=0;
+Ai[7,6]=0;
+Ai[7,8]=0;
+
+Ai[8,1]=0;
+Ai[8,2]=0;
+Ai[8,3]=0;
+Ai[8,4]=0;
+Ai[8,5]=0;
+Ai[8,6]=0;
+Ai[8,7]=0;
+endnodata;
+
+
+/*getting the logits*/
+call mult(data1, beta, logits1);
+call mult(data2, alpha, logits2);
+
+
+/*getting the yhat, residuals and variances*/
+do k=1 to &nrec;
+yhat1[k]=exp(logits1[k])/(1+exp(logits1[k]));
+yhat2[k]=exp(logits2[k])/(1+exp(logits2[k]));
+residuals1[k]=y1[k]-yhat1[k];
+residuals2[k]=y2[k]-yhat2[k];
+std1[k]=sqrt(yhat1[k]*(1-yhat1[k]));
+std2[k]=sqrt(yhat2[k]*(1-yhat2[k]));
+end;
+
+/*calculate quasilikelihood function*/
+do i=1 to 726;
+   do j=1 to 4;
+      Ai[j,j]=std1[((i-1)*4)+j];
+	 Ai[4+j, 4+j]=std2[((i-1)*4)+j];
+     residi[j,1]=residuals1[((i-1)*4)+j];
+	 residi[4+j,1]=residuals2[((i-1)*4)+j];
+    end;
+ call transpose (residi, residit);
+ call mult(Ai, wc, Vim);
+ call mult(Vim, Ai, Vi);
+ call inv(Vi, Viinv);
+ call mult(residit, Viinv, p1);
+ call mult(p1, residi, mult1);
+ call det(Vi, dVi);
+ detVi[1,1]=log(6.2832*dVi);
+ call addmatrix(mult1, detVi, sumi);
+ call addmatrix(tsum, sumi, tsum);
+end;
+model general(-0.5*tsum[1,1]);
+run;
