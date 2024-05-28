@@ -8,7 +8,7 @@ run;
 
 
 /*finding valid moments of interviewer rated health*/
-%partitionedGMM2(file=chinese, timeVar=wave, outVar=inter_healthg,
+%partitionedDataMatrix(file=chinese, timeVar=wave, outVar=inter_healthg,
  predVarTD=  dressingb , 
  idVar=id, alpha=0.05, predVarTI=, distr=bin,
  optim=NLPnms MC=LWY);
@@ -56,7 +56,7 @@ run;
 
 
 /*finding valid moments for ability to attend physical check*/
-%partitionedGMM2(file=chinese, timeVar=wave, outVar=physical_checkb,
+%partitionedDataMatrix(file=chinese, timeVar=wave, outVar=physical_checkb,
  predVarTD= own_decisionb , 
  idVar=id, alpha=0.05, predVarTI=, distr=bin,
  optim=NLPnms MC=LWY);
